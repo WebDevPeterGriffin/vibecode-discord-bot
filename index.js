@@ -9,6 +9,9 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   Events,
   MessageFlags,
 } = require("discord.js");
@@ -64,35 +67,31 @@ async function askVibeCode(question) {
 }
 
 /**
- * Try to DM the user. If DMs are closed, reply ephemerally via interaction.
- * `interaction` may be null when handling a raw DM message (no slash context).
+ * DM the answer to the user.
+ * - interaction: the deferred interaction to editReply on (slash or modal submit)
+ * - dmChannel: pass a DM channel directly (raw DM context, no interaction)
  */
-async function sendAnswer(user, answer, interaction = null) {
-  // Chunk long answers to respect Discord's 2000-char limit
+async function sendAnswer(user, answer, interaction = null, dmChannel = null) {
   const chunks = splitMessage(answer);
 
-  if (interaction) {
-    // Always follow-up via the interaction channel (ephemeral) — DM separately
-    try {
-      await user.send({ content: chunks[0] });
-      for (const chunk of chunks.slice(1)) await user.send({ content: chunk });
-      await interaction.editReply({
-        content: "✅ I sent the answer to your DMs!",
-        flags: MessageFlags.Ephemeral,
-      });
-    } catch {
-      // DMs disabled — fall back to ephemeral reply in channel
-      await interaction.editReply({
-        content: chunks[0],
-        flags: MessageFlags.Ephemeral,
-      });
-      for (const chunk of chunks.slice(1)) {
-        await interaction.followUp({ content: chunk, flags: MessageFlags.Ephemeral });
-      }
-    }
-  } else {
-    // Raw DM context — just reply in the DM channel
-    return chunks; // caller handles sending
+  if (dmChannel) {
+    // Raw DM — reply directly in the DM channel
+    for (const chunk of chunks) await dmChannel.send(chunk);
+    return;
+  }
+
+  try {
+    for (const chunk of chunks) await user.send({ content: chunk });
+    await interaction.editReply({
+      content: "✅ Check your DMs!",
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch {
+    // DMs are closed — tell the user, don't leak the answer to the channel
+    await interaction.editReply({
+      content: "❌ I couldn't DM you. Please enable **Direct Messages** from server members in your Privacy Settings and try again.",
+      flags: MessageFlags.Ephemeral,
+    });
   }
 }
 
@@ -191,12 +190,50 @@ async function postStartupButton() {
 // ── Slash command: /ask ────────────────────────────────────────────────────────
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  // ── Button: open_ask ──────────────────────────────────────────────────────
+  // ── Button: open_ask → show modal ────────────────────────────────────────
   if (interaction.isButton() && interaction.customId === "open_ask") {
-    await interaction.reply({
-      content: "Use `/ask question:<your question>` anywhere in the server and I'll DM you the answer! 🤖",
-      flags: MessageFlags.Ephemeral,
-    });
+    const modal = new ModalBuilder()
+      .setCustomId("ask_modal")
+      .setTitle("Ask VibeCode AI");
+
+    const input = new TextInputBuilder()
+      .setCustomId("question_input")
+      .setLabel("Your question")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("e.g. How do I build an AI agent with Claude?")
+      .setRequired(true)
+      .setMaxLength(500);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // ── Modal submit: ask_modal ───────────────────────────────────────────────
+  if (interaction.isModalSubmit() && interaction.customId === "ask_modal") {
+    const userId = interaction.user.id;
+
+    if (!checkRateLimit(userId)) {
+      await interaction.reply({
+        content: `⏳ Please wait **${cooldownRemaining(userId)}s** before asking again.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const question = interaction.fields.getTextInputValue("question_input").trim();
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    try {
+      const answer = await askVibeCode(question);
+      await sendAnswer(interaction.user, answer, interaction);
+    } catch (err) {
+      console.error("modal submit error:", err);
+      await interaction.editReply({
+        content: "❌ Sorry, I couldn't reach the VibeCode API right now. Try again in a moment.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
     return;
   }
 
@@ -215,11 +252,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const question = interaction.options.getString("question", true);
 
-  // Defer so we have time to call the API (shows "thinking…" in Discord)
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  // Show typing in the channel while we wait (best-effort)
-  interaction.channel?.sendTyping().catch(() => {});
 
   try {
     const answer = await askVibeCode(question);
@@ -254,10 +287,7 @@ client.on(Events.MessageCreate, async (message) => {
 
   try {
     const answer = await askVibeCode(question);
-    const chunks = splitMessage(answer);
-    for (const chunk of chunks) {
-      await message.channel.send(chunk);
-    }
+    await sendAnswer(null, answer, null, message.channel);
   } catch (err) {
     console.error("DM handler error:", err);
     await message.reply("❌ Sorry, I couldn't reach the VibeCode API right now. Try again in a moment.");
